@@ -1,11 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/urfave/cli/v3"
 )
 
 type SearchResult struct {
@@ -76,80 +79,6 @@ type CachedMetadata struct {
 	CachedAt    time.Time          `json:"cached_at"`
 }
 
-var (
-	target              *string
-	pipeline            *string
-	allPipelines        *bool
-	searchTerm          *string
-	buildCount          *int
-	outputFmt           *string
-	job                 *string
-	concourseURL        *string
-	listTargets         *bool
-	buildStatus         *string
-	contextLines        *int
-	noColor             *bool
-	parallel            *int
-	cacheMaxAge         *time.Duration
-	metadataCacheMaxAge *time.Duration
-	noCache             *bool
-	clearCache          *bool
-)
-
-func init() {
-	// Target flags
-	target = flag.String("target", "", "Concourse target name")
-	flag.StringVar(target, "t", "", "Shorthand for --target")
-
-	// Pipeline flags
-	pipeline = flag.String("pipeline", "", "Pipeline name (comma-separated for multiple)")
-	flag.StringVar(pipeline, "p", "", "Shorthand for --pipeline")
-
-	allPipelines = flag.Bool("all-pipelines", false, "Search across ALL pipelines")
-	flag.BoolVar(allPipelines, "a", false, "Shorthand for --all-pipelines")
-
-	// Search flags
-	searchTerm = flag.String("search", "", "Search term/pattern (required)")
-	flag.StringVar(searchTerm, "s", "", "Shorthand for --search")
-
-	// Job flags
-	job = flag.String("job", "", "Specific job name")
-	flag.StringVar(job, "j", "", "Shorthand for --job")
-
-	// Count flags
-	buildCount = flag.Int("count", 1, "Number of recent builds to search per job")
-	flag.IntVar(buildCount, "c", 1, "Shorthand for --count")
-
-	// Output flags
-	outputFmt = flag.String("output", "grep", "Output format: grep or json")
-	flag.StringVar(outputFmt, "o", "grep", "Shorthand for --output")
-
-	contextLines = flag.Int("context", 0, "Number of context lines before/after match")
-	flag.IntVar(contextLines, "C", 0, "Shorthand for --context")
-
-	noColor = flag.Bool("no-color", false, "Disable colorized output")
-
-	// URL flags
-	concourseURL = flag.String("url", "", "Concourse URL for build links (auto-detected if not provided)")
-	flag.StringVar(concourseURL, "u", "", "Shorthand for --url")
-
-	// Status flags
-	buildStatus = flag.String("status", "", "Filter by build status (succeeded/failed/errored/aborted/pending/started)")
-
-	// Listing flags
-	listTargets = flag.Bool("list-targets", false, "List all available fly targets and exit")
-	flag.BoolVar(listTargets, "l", false, "Shorthand for --list-targets")
-
-	// Performance flags
-	parallel = flag.Int("parallel", 5, "Number of parallel log fetches")
-
-	// Cache flags
-	cacheMaxAge = flag.Duration("cache-max-age", 24*time.Hour, "Maximum age of cached logs (e.g., 24h, 1h, 30m)")
-	metadataCacheMaxAge = flag.Duration("metadata-cache-max-age", 5*time.Minute, "Maximum age of cached metadata (e.g., 5m, 10m)")
-	noCache = flag.Bool("no-cache", false, "Disable cache (always fetch fresh)")
-	clearCache = flag.Bool("clear-cache", false, "Clear all cached logs and exit")
-}
-
 // ANSI color codes
 const (
 	colorReset  = "\033[0m"
@@ -161,72 +90,181 @@ const (
 	colorCyan   = "\033[36m"
 	colorWhite  = "\033[37m"
 	colorBold   = "\033[1m"
+	clearToEOL  = "\033[K" // Clear from cursor to end of line
 )
 
 func main() {
-	flag.Parse()
+	cmd := &cli.Command{
+		Name:  "fly-search",
+		Usage: "Search across Concourse CI build logs efficiently",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "target",
+				Aliases: []string{"t"},
+				Usage:   "Concourse target name (required for search)",
+			},
+			&cli.StringFlag{
+				Name:    "pipeline",
+				Aliases: []string{"p"},
+				Usage:   "Pipeline name (comma-separated for multiple)",
+			},
+			&cli.BoolFlag{
+				Name:    "all-pipelines",
+				Aliases: []string{"a"},
+				Usage:   "Search across ALL pipelines (can be slow!)",
+			},
+			&cli.StringFlag{
+				Name:    "search",
+				Aliases: []string{"s"},
+				Usage:   "Search term/pattern (required for search)",
+			},
+			&cli.StringFlag{
+				Name:    "job",
+				Aliases: []string{"j"},
+				Usage:   "Specific job name",
+			},
+			&cli.IntFlag{
+				Name:    "count",
+				Aliases: []string{"c"},
+				Value:   1,
+				Usage:   "Number of recent builds to search per job",
+			},
+			&cli.StringFlag{
+				Name:    "output",
+				Aliases: []string{"o"},
+				Value:   "grep",
+				Usage:   "Output format: grep or json",
+			},
+			&cli.IntFlag{
+				Name:    "context",
+				Aliases: []string{"C"},
+				Value:   0,
+				Usage:   "Number of context lines before/after match",
+			},
+			&cli.BoolFlag{
+				Name:  "no-color",
+				Usage: "Disable colorized output",
+			},
+			&cli.StringFlag{
+				Name:    "url",
+				Aliases: []string{"u"},
+				Usage:   "Concourse URL for build links (auto-detected if not provided)",
+			},
+			&cli.StringFlag{
+				Name:  "status",
+				Usage: "Filter by build status (succeeded/failed/errored/aborted/pending/started)",
+			},
+			&cli.BoolFlag{
+				Name:    "list-targets",
+				Aliases: []string{"l"},
+				Usage:   "List all available fly targets and exit",
+			},
+			&cli.IntFlag{
+				Name:  "parallel",
+				Value: 5,
+				Usage: "Number of parallel log fetches",
+			},
+			&cli.DurationFlag{
+				Name:  "cache-max-age",
+				Value: 24 * time.Hour,
+				Usage: "Maximum age of cached logs (e.g., 24h, 1h, 30m)",
+			},
+			&cli.DurationFlag{
+				Name:  "metadata-cache-max-age",
+				Value: 5 * time.Minute,
+				Usage: "Maximum age of cached metadata (e.g., 5m, 10m)",
+			},
+			&cli.BoolFlag{
+				Name:  "no-cache",
+				Usage: "Disable cache (always fetch fresh)",
+			},
+			&cli.BoolFlag{
+				Name:  "clear-cache",
+				Usage: "Clear all cached logs and exit",
+			},
+		},
+		Action: runSearch,
+	}
 
-	// Handle -clear-cache flag
-	if *clearCache {
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runSearch(ctx context.Context, cmd *cli.Command) error {
+	// Handle --clear-cache flag
+	if cmd.Bool("clear-cache") {
 		if err := clearCacheDir(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error clearing cache: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("error clearing cache: %w", err)
 		}
 		fmt.Println("Cache cleared successfully")
-		return
+		return nil
 	}
 
-	// Handle -list-targets flag
-	if *listTargets {
+	// Handle --list-targets flag
+	if cmd.Bool("list-targets") {
 		listAvailableTargets()
-		return
+		return nil
 	}
+
+	// Get flag values
+	target := cmd.String("target")
+	pipeline := cmd.String("pipeline")
+	allPipelines := cmd.Bool("all-pipelines")
+	searchTerm := cmd.String("search")
+	job := cmd.String("job")
+	buildCount := cmd.Int("count")
+	outputFmt := cmd.String("output")
+	contextLines := cmd.Int("context")
+	noColor := cmd.Bool("no-color")
+	concourseURL := cmd.String("url")
+	buildStatus := cmd.String("status")
+	parallel := cmd.Int("parallel")
+	cacheMaxAge := cmd.Duration("cache-max-age")
+	metadataCacheMaxAge := cmd.Duration("metadata-cache-max-age")
+	noCache := cmd.Bool("no-cache")
 
 	// Validate required flags for search
-	if *target == "" || *searchTerm == "" {
-		if *target == "" {
-			fmt.Fprintf(os.Stderr, "Error: target is required\n\n")
-			fmt.Fprintf(os.Stderr, "Available targets:\n")
-			listAvailableTargets()
-			fmt.Fprintf(os.Stderr, "\nUse -target flag to specify a target, or -list-targets to see more details\n\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: target and search are required\n\n")
-		}
-		flag.Usage()
-		os.Exit(1)
+	if target == "" {
+		fmt.Fprintf(os.Stderr, "Error: --target is required\n\n")
+		fmt.Fprintf(os.Stderr, "Available targets:\n")
+		listAvailableTargets()
+		fmt.Fprintf(os.Stderr, "\nUse --target flag to specify a target, or --list-targets to see more details\n\n")
+		return cli.Exit("", 1)
+	}
+
+	if searchTerm == "" {
+		return cli.Exit("Error: --search is required", 1)
 	}
 
 	// Require either -pipeline or -all-pipelines
-	if *pipeline == "" && !*allPipelines {
-		fmt.Fprintf(os.Stderr, "Error: either -pipeline or -all-pipelines is required\n\n")
-		fmt.Fprintf(os.Stderr, "Use -pipeline <name> to search specific pipeline(s)\n")
-		fmt.Fprintf(os.Stderr, "Use -all-pipelines to search ALL pipelines (can be slow!)\n\n")
-		flag.Usage()
-		os.Exit(1)
+	if pipeline == "" && !allPipelines {
+		return cli.Exit("Error: either --pipeline or --all-pipelines is required\n\n"+
+			"Use --pipeline <name> to search specific pipeline(s)\n"+
+			"Use --all-pipelines to search ALL pipelines (can be slow!)", 1)
 	}
 
 	// Prevent both -pipeline and -all-pipelines
-	if *pipeline != "" && *allPipelines {
-		fmt.Fprintf(os.Stderr, "Error: cannot use both -pipeline and -all-pipelines\n")
-		os.Exit(1)
+	if pipeline != "" && allPipelines {
+		return cli.Exit("Error: cannot use both --pipeline and --all-pipelines", 1)
 	}
 
 	// Initialize cache directory
-	if !*noCache {
+	if !noCache {
 		if err := initCacheDir(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to initialize cache directory: %v\n", err)
 			fmt.Fprintf(os.Stderr, "Continuing without cache...\n")
-			*noCache = true
+			noCache = true
 		}
 	}
 
 	// Auto-detect Concourse URL from target if not provided
-	baseURL := *concourseURL
+	baseURL := concourseURL
 	if baseURL == "" {
-		detectedURL, err := getTargetURL(*target)
+		detectedURL, err := getTargetURL(target)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to auto-detect Concourse URL: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Build links will not be generated. Use -url flag to specify manually.\n\n")
+			fmt.Fprintf(os.Stderr, "Build links will not be generated. Use --url flag to specify manually.\n\n")
 		} else {
 			baseURL = detectedURL
 			fmt.Fprintf(os.Stderr, "Auto-detected Concourse URL: %s\n", baseURL)
@@ -236,8 +274,8 @@ func main() {
 	var allBuilds []Build
 
 	// If -all-pipelines flag is set, search ALL pipelines
-	if *allPipelines {
-		fmt.Fprintf(os.Stderr, "Searching ALL pipelines in target '%s'...\n", *target)
+	if allPipelines {
+		fmt.Fprintf(os.Stderr, "Searching ALL pipelines in target '%s'...\n", target)
 
 		var pipelines []Pipeline
 		var cachedJobsMap map[string][]Job
@@ -247,8 +285,8 @@ func main() {
 		var needsUpdate bool
 
 		// Try to load from metadata cache
-		if !*noCache {
-			cached, cacheErr := loadMetadataCache(*target, *metadataCacheMaxAge)
+		if !noCache {
+			cached, cacheErr := loadMetadataCache(target, metadataCacheMaxAge)
 			if cacheErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: metadata cache error: %v\n", cacheErr)
 			} else if cached != nil {
@@ -266,15 +304,14 @@ func main() {
 		// If not cached, fetch fresh metadata
 		if pipelines == nil {
 			fmt.Fprintf(os.Stderr, "Fetching pipeline list...\n")
-			pipelines, err = getAllPipelines(*target)
+			pipelines, err = getAllPipelines(target)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error fetching pipelines: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("error fetching pipelines: %w", err)
 			}
 
 			if len(pipelines) == 0 {
 				fmt.Println("No pipelines found")
-				return
+				return nil
 			}
 
 			fmt.Fprintf(os.Stderr, "Found %d pipeline(s), fetching jobs and builds...\n", len(pipelines))
@@ -286,10 +323,10 @@ func main() {
 
 			for idx, pl := range pipelines {
 				// Show progress during discovery
-				fmt.Fprintf(os.Stderr, "\rDiscovering builds... pipeline %d/%d (%s)", idx+1, len(pipelines), pl.Name)
+				fmt.Fprintf(os.Stderr, "\rDiscovering builds... pipeline %d/%d (%s)%s", idx+1, len(pipelines), pl.Name, clearToEOL)
 
 				// Get jobs for this pipeline
-				jobs, err := getJobs(*target, pl.Name)
+				jobs, err := getJobs(target, pl.Name)
 				if err != nil {
 					// Silently skip - will show warning at end
 					continue
@@ -299,16 +336,17 @@ func main() {
 				// Get builds for each job
 				for _, j := range jobs {
 					cacheKey := fmt.Sprintf("%s/%s", pl.Name, j.Name)
-					builds, err := getBuilds(*target, pl.Name, j.Name, *buildCount)
+					builds, err := getBuilds(target, pl.Name, j.Name, buildCount)
 					if err != nil {
 						// Silently skip
 						continue
 					}
 					cachedBuildsMap[cacheKey] = builds
-					buildCountsMap[cacheKey] = *buildCount
+					buildCountsMap[cacheKey] = buildCount
 				}
 			}
-			fmt.Fprintf(os.Stderr, "\n") // Newline after discovery progress
+			fmt.Fprintf(os.Stderr, "\r%s", clearToEOL) // Clear discovery progress line
+			fmt.Fprintf(os.Stderr, "Discovery complete\n")
 			needsUpdate = true
 		} else {
 			// Cache exists - check if we need more builds than cached
@@ -319,16 +357,16 @@ func main() {
 					cacheKey := fmt.Sprintf("%s/%s", pl.Name, j.Name)
 					cachedCount := buildCountsMap[cacheKey]
 
-					if cachedCount < *buildCount {
+					if cachedCount < buildCount {
 						// Need to fetch more builds for this job
 						if !needsUpdate {
 							fmt.Fprintf(os.Stderr, "Cache has fewer builds than requested, fetching additional builds...\n")
 							needsUpdate = true
 						}
-						builds, err := getBuilds(*target, pl.Name, j.Name, *buildCount)
+						builds, err := getBuilds(target, pl.Name, j.Name, buildCount)
 						if err == nil {
 							cachedBuildsMap[cacheKey] = builds
-							buildCountsMap[cacheKey] = *buildCount
+							buildCountsMap[cacheKey] = buildCount
 						}
 					}
 				}
@@ -336,14 +374,14 @@ func main() {
 		}
 
 		// Save updated cache if needed
-		if needsUpdate && !*noCache {
-			if err := saveMetadataCache(*target, pipelines, cachedJobsMap, cachedBuildsMap, buildCountsMap); err != nil {
+		if needsUpdate && !noCache {
+			if err := saveMetadataCache(target, pipelines, cachedJobsMap, cachedBuildsMap, buildCountsMap); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to save metadata cache: %v\n", err)
 			}
 		}
 
 		// Now extract builds based on job filter
-		if *job == "" {
+		if job == "" {
 			// All jobs in all pipelines
 			for _, pl := range pipelines {
 				jobs := cachedJobsMap[pl.Name]
@@ -351,8 +389,8 @@ func main() {
 					cacheKey := fmt.Sprintf("%s/%s", pl.Name, j.Name)
 					builds := cachedBuildsMap[cacheKey]
 					// Take only the requested count from cached builds
-					if len(builds) > *buildCount {
-						builds = builds[:*buildCount]
+					if len(builds) > buildCount {
+						builds = builds[:buildCount]
 					}
 					allBuilds = append(allBuilds, builds...)
 				}
@@ -360,18 +398,18 @@ func main() {
 		} else {
 			// Specific job across all pipelines
 			for _, pl := range pipelines {
-				cacheKey := fmt.Sprintf("%s/%s", pl.Name, *job)
+				cacheKey := fmt.Sprintf("%s/%s", pl.Name, job)
 				builds := cachedBuildsMap[cacheKey]
 				// Take only the requested count from cached builds
-				if len(builds) > *buildCount {
-					builds = builds[:*buildCount]
+				if len(builds) > buildCount {
+					builds = builds[:buildCount]
 				}
 				allBuilds = append(allBuilds, builds...)
 			}
 		}
 	} else {
 		// Support multiple pipelines (comma-separated)
-		pipelines := strings.Split(*pipeline, ",")
+		pipelines := strings.Split(pipeline, ",")
 
 		for _, p := range pipelines {
 			p = strings.TrimSpace(p)
@@ -380,15 +418,71 @@ func main() {
 			}
 
 			// If no job specified, get all jobs in the pipeline
-			if *job == "" {
-				jobs, err := getJobs(*target, p)
+			if job == "" {
+				jobs, err := getJobs(target, p)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to get jobs for pipeline %s: %v\n", p, err)
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+
+					// Check if it's an authentication error - exit immediately
+					if strings.Contains(err.Error(), "not authorized") || strings.Contains(err.Error(), "log in") {
+						return cli.Exit("", 1)
+					}
+
+					// Try to show similar pipeline names
+					pipelines, listErr := getAllPipelines(target)
+					if listErr == nil && len(pipelines) > 0 {
+						// Find pipelines with similar names
+						var similar []string
+						pLower := strings.ToLower(p)
+
+						// Strategy: look for pipelines that share significant substrings
+						for _, pl := range pipelines {
+							plLower := strings.ToLower(pl.Name)
+
+							// Check if they share a word/hyphenated part
+							pParts := strings.Split(pLower, "-")
+							plParts := strings.Split(plLower, "-")
+
+							matchCount := 0
+							for _, pp := range pParts {
+								if len(pp) < 3 {
+									continue // Skip very short parts
+								}
+								for _, plp := range plParts {
+									if strings.Contains(plp, pp) || strings.Contains(pp, plp) {
+										matchCount++
+										break
+									}
+								}
+							}
+
+							// If at least one meaningful part matches, consider it similar
+							if matchCount > 0 {
+								similar = append(similar, pl.Name)
+							}
+						}
+
+						if len(similar) > 0 {
+							fmt.Fprintf(os.Stderr, "\nDid you mean:\n")
+							for _, name := range similar[:min(5, len(similar))] {
+								fmt.Fprintf(os.Stderr, "  - %s\n", name)
+							}
+						} else {
+							fmt.Fprintf(os.Stderr, "\nAvailable pipelines (showing first 10):\n")
+							for i := 0; i < min(10, len(pipelines)); i++ {
+								fmt.Fprintf(os.Stderr, "  - %s\n", pipelines[i].Name)
+							}
+							if len(pipelines) > 10 {
+								fmt.Fprintf(os.Stderr, "  ... and %d more\n", len(pipelines)-10)
+							}
+						}
+						fmt.Fprintf(os.Stderr, "\nRun: fly -t %s pipelines  (to see all pipelines)\n", target)
+					}
 					continue
 				}
 
 				for _, j := range jobs {
-					builds, err := getBuilds(*target, p, j.Name, *buildCount)
+					builds, err := getBuilds(target, p, j.Name, buildCount)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Warning: failed to get builds for %s/%s: %v\n", p, j.Name, err)
 						continue
@@ -397,9 +491,13 @@ func main() {
 				}
 			} else {
 				// Get builds for specific job
-				builds, err := getBuilds(*target, p, *job, *buildCount)
+				builds, err := getBuilds(target, p, job, buildCount)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error fetching builds for %s/%s: %v\n", p, *job, err)
+					fmt.Fprintf(os.Stderr, "Error fetching builds for %s/%s: %v\n", p, job, err)
+					// Check if it's an authentication error - exit immediately
+					if strings.Contains(err.Error(), "not authorized") || strings.Contains(err.Error(), "log in") {
+						return cli.Exit("", 1)
+					}
 					continue
 				}
 				allBuilds = append(allBuilds, builds...)
@@ -409,35 +507,37 @@ func main() {
 
 	if len(allBuilds) == 0 {
 		fmt.Println("No builds found")
-		return
+		return nil
 	}
 
 	fmt.Fprintf(os.Stderr, "Found %d total builds to search\n", len(allBuilds))
 
 	// Filter by build status if specified
-	if *buildStatus != "" {
+	if buildStatus != "" {
 		filteredBuilds := []Build{}
 		for _, b := range allBuilds {
-			if strings.EqualFold(b.Status, *buildStatus) {
+			if strings.EqualFold(b.Status, buildStatus) {
 				filteredBuilds = append(filteredBuilds, b)
 			}
 		}
 		allBuilds = filteredBuilds
 		if len(allBuilds) == 0 {
-			fmt.Printf("No builds found with status: %s\n", *buildStatus)
-			return
+			fmt.Printf("No builds found with status: %s\n", buildStatus)
+			return nil
 		}
 	}
 
 	// Search through logs with parallelization
-	results := searchLogsParallel(allBuilds, *searchTerm, *target, baseURL, *parallel, *contextLines)
+	results := searchLogsParallel(allBuilds, searchTerm, target, baseURL, parallel, contextLines, cacheMaxAge, noCache, noColor)
 
 	// Output results
-	if *outputFmt == "json" {
+	if outputFmt == "json" {
 		outputJSON(results)
 	} else {
-		outputGrep(results, *searchTerm)
+		outputGrep(results, searchTerm, noColor, contextLines)
 	}
+
+	return nil
 }
 
 func getCacheDir() (string, error) {
@@ -643,9 +743,14 @@ func listAvailableTargets() {
 
 func getAllPipelines(target string) ([]Pipeline, error) {
 	cmd := exec.Command("fly", "-t", target, "pipelines", "--json")
-	output, err := cmd.Output()
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get pipelines: %w", err)
+		outputStr := string(output)
+		// Check for authentication errors
+		if strings.Contains(outputStr, "not authorized") || strings.Contains(outputStr, "log in") {
+			return nil, fmt.Errorf("not authorized. Please run: fly -t %s login", target)
+		}
+		return nil, fmt.Errorf("failed to get pipelines: %w\nOutput: %s", err, outputStr)
 	}
 
 	var pipelines []Pipeline
@@ -679,12 +784,28 @@ func getTargetURL(target string) (string, error) {
 func getJobs(target, pipeline string) ([]Job, error) {
 	cmd := exec.Command("fly", "-t", target, "curl", fmt.Sprintf("/api/v1/teams/main/pipelines/%s/jobs", pipeline))
 	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get jobs: %w", err)
+
+	// Check for authentication errors
+	if err != nil || len(output) == 0 {
+		// Get stderr for error messages
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			stderr := string(exitErr.Stderr)
+			if strings.Contains(stderr, "not authorized") || strings.Contains(stderr, "log in") {
+				return nil, fmt.Errorf("not authorized. Please run: fly -t %s login", target)
+			}
+		}
+		// Check for empty response which usually means pipeline doesn't exist
+		if len(output) == 0 {
+			return nil, fmt.Errorf("pipeline '%s' not found (check spelling or run: fly -t %s pipelines)", pipeline, target)
+		}
 	}
 
 	var jobs []Job
 	if err := json.Unmarshal(output, &jobs); err != nil {
+		// Check if it's because the pipeline doesn't exist
+		if strings.Contains(err.Error(), "unexpected end of JSON input") || strings.Contains(err.Error(), "invalid character") {
+			return nil, fmt.Errorf("pipeline '%s' not found (check spelling or run: fly -t %s pipelines)", pipeline, target)
+		}
 		return nil, fmt.Errorf("failed to parse jobs JSON: %w", err)
 	}
 
@@ -701,8 +822,13 @@ func getBuilds(target, pipeline, job string, count int) ([]Build, error) {
 	cmd := exec.Command("fly", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		outputStr := string(output)
+		// Check for authentication errors
+		if strings.Contains(outputStr, "not authorized") || strings.Contains(outputStr, "log in") {
+			return nil, fmt.Errorf("not authorized. Please run: fly -t %s login", target)
+		}
 		// If command fails, show the actual error from fly
-		return nil, fmt.Errorf("failed to run fly builds:\n%s", string(output))
+		return nil, fmt.Errorf("failed to run fly builds:\n%s", outputStr)
 	}
 
 	var builds []Build
@@ -713,7 +839,7 @@ func getBuilds(target, pipeline, job string, count int) ([]Build, error) {
 	return builds, nil
 }
 
-func searchLogsParallel(builds []Build, searchTerm, target, baseURL string, parallelCount, contextLines int) []SearchResult {
+func searchLogsParallel(builds []Build, searchTerm, target, baseURL string, parallelCount, contextLines int, cacheMaxAge time.Duration, noCache, noColor bool) []SearchResult {
 	var results []SearchResult
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -740,7 +866,7 @@ func searchLogsParallel(builds []Build, searchTerm, target, baseURL string, para
 			fmt.Fprintf(os.Stderr, "\rSearching builds... %d/%d", completed, total)
 			mu.Unlock()
 
-			buildResults := searchSingleBuild(b, searchTerm, target, baseURL, contextLines)
+			buildResults := searchSingleBuild(b, searchTerm, target, baseURL, contextLines, cacheMaxAge, noCache, noColor)
 
 			// Thread-safe append
 			mu.Lock()
@@ -760,7 +886,7 @@ func searchLogsParallel(builds []Build, searchTerm, target, baseURL string, para
 	return results
 }
 
-func searchSingleBuild(build Build, searchTerm, target, baseURL string, contextLines int) []SearchResult {
+func searchSingleBuild(build Build, searchTerm, target, baseURL string, contextLines int, cacheMaxAge time.Duration, noCache, noColor bool) []SearchResult {
 	var results []SearchResult
 	searchRegex := regexp.MustCompile(searchTerm)
 	// Regex to detect task start: "running <task-path>"
@@ -771,8 +897,8 @@ func searchSingleBuild(build Build, searchTerm, target, baseURL string, contextL
 	var err error
 
 	// Try to load from cache
-	if !*noCache {
-		cached, cacheErr := loadFromCache(target, build.ID, *cacheMaxAge)
+	if !noCache {
+		cached, cacheErr := loadFromCache(target, build.ID, cacheMaxAge)
 		if cacheErr != nil {
 			// Silently skip cache errors
 		} else if cached != nil {
@@ -797,7 +923,7 @@ func searchSingleBuild(build Build, searchTerm, target, baseURL string, contextL
 		}
 
 		// Save to cache
-		if !*noCache {
+		if !noCache {
 			if err := saveToCache(target, build.ID, logs, taskNames, build.Status); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to save to cache for build %d: %v\n", build.ID, err)
 			}
@@ -925,8 +1051,17 @@ func extractTasks(data json.RawMessage, taskMap map[string]string) {
 }
 
 func getBuildLogs(target string, buildID int) (string, error) {
-	cmd := exec.Command("fly", "-t", target, "watch", "-b", fmt.Sprintf("%d", buildID))
+	// Add 30-second timeout to prevent hanging
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "fly", "-t", target, "watch", "-b", fmt.Sprintf("%d", buildID))
 	output, err := cmd.CombinedOutput()
+
+	// Check if context deadline exceeded
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("fly watch timed out after 30s for build %d", buildID)
+	}
 
 	// fly watch returns non-zero exit code when the build failed,
 	// but we still get valid log output. Only return error if output is empty.
@@ -949,15 +1084,15 @@ func generateBuildURL(baseURL, team, pipeline, job, buildName string, lineNum in
 		strings.TrimRight(baseURL, "/"), team, pipeline, job, buildName)
 }
 
-func colorize(text, color string) string {
-	if *noColor {
+func colorize(text, color string, noColor bool) string {
+	if noColor {
 		return text
 	}
 	return color + text + colorReset
 }
 
-func highlightMatch(text, pattern string) string {
-	if *noColor {
+func highlightMatch(text, pattern string, noColor bool) string {
+	if noColor {
 		return text
 	}
 	re := regexp.MustCompile(pattern)
@@ -966,7 +1101,7 @@ func highlightMatch(text, pattern string) string {
 	})
 }
 
-func outputGrep(results []SearchResult, searchPattern string) {
+func outputGrep(results []SearchResult, searchPattern string, noColor bool, contextLines int) {
 	if len(results) == 0 {
 		fmt.Println("No matches found")
 		return
@@ -1010,7 +1145,7 @@ func outputGrep(results []SearchResult, searchPattern string) {
 		// Strip ANSI codes for cleaner display
 		content = stripANSI(content)
 		// Highlight match in content
-		contentDisplay := highlightMatch(content, searchPattern)
+		contentDisplay := highlightMatch(content, searchPattern, noColor)
 		if len(content) > 33 {
 			content = content[:30] + "..."
 			contentDisplay = content // Don't highlight truncated content
@@ -1019,7 +1154,7 @@ func outputGrep(results []SearchResult, searchPattern string) {
 		fmt.Printf("║ %-37s ║ %-8s ║ %-4d ║ %-26s ║ %-33s ║\n", jobPath, r.BuildID, r.Line, task, contentDisplay)
 
 		// Print context lines if present
-		if len(r.Context) > 0 && *contextLines > 0 {
+		if len(r.Context) > 0 && contextLines > 0 {
 			fmt.Println("╠═══════════════════════════════════════╩══════════╩══════╩════════════════════════════╩═══════════════════════════════════╣")
 			fmt.Println("║ " + colorCyan + "Context:" + colorReset)
 			for _, ctx := range r.Context {
@@ -1029,7 +1164,7 @@ func outputGrep(results []SearchResult, searchPattern string) {
 				}
 				// Highlight match in context
 				if regexp.MustCompile(searchPattern).MatchString(ctx) {
-					cleanCtx = highlightMatch(cleanCtx, searchPattern)
+					cleanCtx = highlightMatch(cleanCtx, searchPattern, noColor)
 				}
 				fmt.Printf("║   %s\n", cleanCtx)
 			}
@@ -1047,19 +1182,19 @@ func outputGrep(results []SearchResult, searchPattern string) {
 	// Print URLs separately if available
 	if len(results) > 0 && results[0].BuildURLLine != "" {
 		fmt.Println()
-		fmt.Println(colorize("Build URLs:", colorBold))
+		fmt.Println(colorize("Build URLs:", colorBold, noColor))
 
 		// Track unique build URLs to avoid duplicates
 		printed := make(map[string]bool)
 		for _, r := range results {
 			if r.BuildURLLine != "" && !printed[r.BuildURLLine] {
-				fmt.Printf("  [Build %s] %s\n", colorize(r.BuildID, colorGreen), r.BuildURLLine)
+				fmt.Printf("  [Build %s] %s\n", colorize(r.BuildID, colorGreen, noColor), r.BuildURLLine)
 				printed[r.BuildURLLine] = true
 			}
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "\n"+colorize("Found %d match(es)", colorBold)+"\n", len(results))
+	fmt.Fprintf(os.Stderr, "\n"+colorize("Found %d match(es)", colorBold, noColor)+"\n", len(results))
 }
 
 func stripANSI(str string) string {
