@@ -411,6 +411,38 @@ func runSearch(ctx context.Context, cmd *cli.Command) error {
 		// Support multiple pipelines (comma-separated)
 		pipelines := strings.Split(pipeline, ",")
 
+		// Try to load metadata cache for this target
+		var cachedJobsMap map[string][]Job
+		var cachedBuildsMap map[string][]Build
+		var buildCountsMap map[string]int
+		var needsUpdate bool
+
+		if !noCache {
+			cached, cacheErr := loadMetadataCache(target, metadataCacheMaxAge)
+			if cacheErr != nil {
+				// Cache doesn't exist or error reading - that's fine, we'll fetch fresh
+			} else if cached != nil {
+				fmt.Fprintf(os.Stderr, "Using cached job/build metadata (cached %s ago)\n", time.Since(cached.CachedAt).Round(time.Second))
+				cachedJobsMap = cached.Jobs
+				cachedBuildsMap = cached.Builds
+				buildCountsMap = cached.BuildCounts
+				if buildCountsMap == nil {
+					buildCountsMap = make(map[string]int)
+				}
+			}
+		}
+
+		// Initialize maps if not loaded from cache
+		if cachedJobsMap == nil {
+			cachedJobsMap = make(map[string][]Job)
+		}
+		if cachedBuildsMap == nil {
+			cachedBuildsMap = make(map[string][]Build)
+		}
+		if buildCountsMap == nil {
+			buildCountsMap = make(map[string]int)
+		}
+
 		for _, p := range pipelines {
 			p = strings.TrimSpace(p)
 			if p == "" {
@@ -419,75 +451,101 @@ func runSearch(ctx context.Context, cmd *cli.Command) error {
 
 			// If no job specified, get all jobs in the pipeline
 			if job == "" {
-				jobs, err := getJobs(target, p)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				// Check if we have cached jobs for this pipeline
+				jobs, hasCachedJobs := cachedJobsMap[p]
+				if !hasCachedJobs {
+					// Fetch jobs from API
+					var err error
+					jobs, err = getJobs(target, p)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 
-					// Check if it's an authentication error - exit immediately
-					if strings.Contains(err.Error(), "not authorized") || strings.Contains(err.Error(), "log in") {
-						return cli.Exit("", 1)
-					}
+						// Check if it's an authentication error - exit immediately
+						if strings.Contains(err.Error(), "not authorized") || strings.Contains(err.Error(), "log in") {
+							return cli.Exit("", 1)
+						}
 
-					// Try to show similar pipeline names
-					pipelines, listErr := getAllPipelines(target)
-					if listErr == nil && len(pipelines) > 0 {
-						// Find pipelines with similar names
-						var similar []string
-						pLower := strings.ToLower(p)
+						// Try to show similar pipeline names
+						pipelines, listErr := getAllPipelines(target)
+						if listErr == nil && len(pipelines) > 0 {
+							// Find pipelines with similar names
+							var similar []string
+							pLower := strings.ToLower(p)
 
-						// Strategy: look for pipelines that share significant substrings
-						for _, pl := range pipelines {
-							plLower := strings.ToLower(pl.Name)
+							// Strategy: look for pipelines that share significant substrings
+							for _, pl := range pipelines {
+								plLower := strings.ToLower(pl.Name)
 
-							// Check if they share a word/hyphenated part
-							pParts := strings.Split(pLower, "-")
-							plParts := strings.Split(plLower, "-")
+								// Check if they share a word/hyphenated part
+								pParts := strings.Split(pLower, "-")
+								plParts := strings.Split(plLower, "-")
 
-							matchCount := 0
-							for _, pp := range pParts {
-								if len(pp) < 3 {
-									continue // Skip very short parts
-								}
-								for _, plp := range plParts {
-									if strings.Contains(plp, pp) || strings.Contains(pp, plp) {
-										matchCount++
-										break
+								matchCount := 0
+								for _, pp := range pParts {
+									if len(pp) < 3 {
+										continue // Skip very short parts
+									}
+									for _, plp := range plParts {
+										if strings.Contains(plp, pp) || strings.Contains(pp, plp) {
+											matchCount++
+											break
+										}
 									}
 								}
+
+								// If at least one meaningful part matches, consider it similar
+								if matchCount > 0 {
+									similar = append(similar, pl.Name)
+								}
 							}
 
-							// If at least one meaningful part matches, consider it similar
-							if matchCount > 0 {
-								similar = append(similar, pl.Name)
+							if len(similar) > 0 {
+								fmt.Fprintf(os.Stderr, "\nDid you mean:\n")
+								for _, name := range similar[:min(5, len(similar))] {
+									fmt.Fprintf(os.Stderr, "  - %s\n", name)
+								}
+							} else {
+								fmt.Fprintf(os.Stderr, "\nAvailable pipelines (showing first 10):\n")
+								for i := 0; i < min(10, len(pipelines)); i++ {
+									fmt.Fprintf(os.Stderr, "  - %s\n", pipelines[i].Name)
+								}
+								if len(pipelines) > 10 {
+									fmt.Fprintf(os.Stderr, "  ... and %d more\n", len(pipelines)-10)
+								}
 							}
+							fmt.Fprintf(os.Stderr, "\nRun: fly -t %s pipelines  (to see all pipelines)\n", target)
 						}
-
-						if len(similar) > 0 {
-							fmt.Fprintf(os.Stderr, "\nDid you mean:\n")
-							for _, name := range similar[:min(5, len(similar))] {
-								fmt.Fprintf(os.Stderr, "  - %s\n", name)
-							}
-						} else {
-							fmt.Fprintf(os.Stderr, "\nAvailable pipelines (showing first 10):\n")
-							for i := 0; i < min(10, len(pipelines)); i++ {
-								fmt.Fprintf(os.Stderr, "  - %s\n", pipelines[i].Name)
-							}
-							if len(pipelines) > 10 {
-								fmt.Fprintf(os.Stderr, "  ... and %d more\n", len(pipelines)-10)
-							}
-						}
-						fmt.Fprintf(os.Stderr, "\nRun: fly -t %s pipelines  (to see all pipelines)\n", target)
+						continue
 					}
-					continue
+					cachedJobsMap[p] = jobs
+					needsUpdate = true
 				}
 
 				fmt.Fprintf(os.Stderr, "Fetching builds for %d job(s) in pipeline '%s'...\n", len(jobs), p)
 				for idx, j := range jobs {
-					fmt.Fprintf(os.Stderr, "\rFetching builds... job %d/%d (%s)%s", idx+1, len(jobs), j.Name, clearToEOL)
-					builds, err := getBuilds(target, p, j.Name, buildCount)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "\nWarning: failed to get builds for %s/%s: %v\n", p, j.Name, err)
-						continue
+					cacheKey := fmt.Sprintf("%s/%s", p, j.Name)
+					cachedCount := buildCountsMap[cacheKey]
+
+					// Check if we need to fetch builds
+					if cachedCount < buildCount {
+						fmt.Fprintf(os.Stderr, "\rFetching builds... job %d/%d (%s)%s", idx+1, len(jobs), j.Name, clearToEOL)
+						builds, err := getBuilds(target, p, j.Name, buildCount)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "\nWarning: failed to get builds for %s/%s: %v\n", p, j.Name, err)
+							continue
+						}
+						cachedBuildsMap[cacheKey] = builds
+						buildCountsMap[cacheKey] = buildCount
+						needsUpdate = true
+					} else {
+						// Use cached builds
+						fmt.Fprintf(os.Stderr, "\rUsing cached builds... job %d/%d (%s)%s", idx+1, len(jobs), j.Name, clearToEOL)
+					}
+
+					// Get builds from cache (or newly fetched)
+					builds := cachedBuildsMap[cacheKey]
+					if len(builds) > buildCount {
+						builds = builds[:buildCount]
 					}
 					allBuilds = append(allBuilds, builds...)
 				}
@@ -495,16 +553,63 @@ func runSearch(ctx context.Context, cmd *cli.Command) error {
 				fmt.Fprintf(os.Stderr, "Fetched builds for %d job(s)\n", len(jobs))
 			} else {
 				// Get builds for specific job
-				builds, err := getBuilds(target, p, job, buildCount)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error fetching builds for %s/%s: %v\n", p, job, err)
-					// Check if it's an authentication error - exit immediately
-					if strings.Contains(err.Error(), "not authorized") || strings.Contains(err.Error(), "log in") {
-						return cli.Exit("", 1)
+				cacheKey := fmt.Sprintf("%s/%s", p, job)
+				cachedCount := buildCountsMap[cacheKey]
+
+				var builds []Build
+				if cachedCount >= buildCount {
+					// Use cached builds
+					fmt.Fprintf(os.Stderr, "Using cached builds for %s/%s\n", p, job)
+					builds = cachedBuildsMap[cacheKey]
+					if len(builds) > buildCount {
+						builds = builds[:buildCount]
 					}
-					continue
+				} else {
+					// Fetch fresh builds
+					var err error
+					builds, err = getBuilds(target, p, job, buildCount)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error fetching builds for %s/%s: %v\n", p, job, err)
+						// Check if it's an authentication error - exit immediately
+						if strings.Contains(err.Error(), "not authorized") || strings.Contains(err.Error(), "log in") {
+							return cli.Exit("", 1)
+						}
+						continue
+					}
+					cachedBuildsMap[cacheKey] = builds
+					buildCountsMap[cacheKey] = buildCount
+					needsUpdate = true
 				}
 				allBuilds = append(allBuilds, builds...)
+			}
+		}
+
+		// Save updated cache if we fetched new data
+		if needsUpdate && !noCache {
+			// We need to load the full cache first to merge our updates
+			var allPipelines []Pipeline
+			cached, _ := loadMetadataCache(target, metadataCacheMaxAge)
+			if cached != nil {
+				allPipelines = cached.Pipelines
+				// Merge existing cache data
+				for k, v := range cached.Jobs {
+					if _, exists := cachedJobsMap[k]; !exists {
+						cachedJobsMap[k] = v
+					}
+				}
+				for k, v := range cached.Builds {
+					if _, exists := cachedBuildsMap[k]; !exists {
+						cachedBuildsMap[k] = v
+					}
+				}
+				for k, v := range cached.BuildCounts {
+					if _, exists := buildCountsMap[k]; !exists {
+						buildCountsMap[k] = v
+					}
+				}
+			}
+			if err := saveMetadataCache(target, allPipelines, cachedJobsMap, cachedBuildsMap, buildCountsMap); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to save metadata cache: %v\n", err)
 			}
 		}
 	}
