@@ -15,7 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/term"
 )
 
 type SearchResult struct {
@@ -1216,18 +1218,49 @@ func outputGrep(results []SearchResult, searchPattern string, noColor bool, cont
 		return
 	}
 
-	// Print table header
-	fmt.Println()
-	fmt.Println("╔═══════════════════════════════════════╦══════════╦══════╦════════════════════════════╦═══════════════════════════════════╗")
-	fmt.Printf("║ %-37s ║ %-8s ║ %-4s ║ %-26s ║ %-33s ║\n", "PIPELINE / JOB", "BUILD", "LINE", "TASK", "MATCHED CONTENT")
-	fmt.Println("╠═══════════════════════════════════════╬══════════╬══════╬════════════════════════════╬═══════════════════════════════════╣")
+	// Get terminal width
+	termWidth, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || termWidth == 0 {
+		termWidth = 120 // Default fallback width
+	}
 
-	// Print results
-	for i, r := range results {
+	// Create table with go-pretty
+	t := table.NewWriter()
+	t.SetOutputMirror(os.Stdout)
+	t.SetStyle(table.StyleRounded)
+
+	// Limit table to terminal width
+	t.SetAllowedRowLength(termWidth)
+
+	// Calculate column widths based on terminal size
+	// Fixed widths for: Pipeline/Job (30), Build (8), Line (6), Task (15)
+	// Borders and spacing: ~10 chars
+	fixedWidth := 30 + 8 + 6 + 15 + 10
+	contentWidth := termWidth - fixedWidth
+
+	// Ensure minimum widths
+	if contentWidth < 40 {
+		contentWidth = 40 // Minimum content width
+	}
+	if contentWidth > 120 {
+		contentWidth = 120 // Maximum content width for readability
+	}
+
+	// Set column configurations with dynamic content width
+	t.SetColumnConfigs([]table.ColumnConfig{
+		{Number: 1, WidthMax: 30, WidthMin: 20}, // Pipeline/Job
+		{Number: 2, WidthMax: 8},                // Build
+		{Number: 3, WidthMax: 6},                // Line
+		{Number: 4, WidthMax: 15},               // Task
+		{Number: 5, WidthMax: contentWidth},     // Content - dynamic based on terminal!
+	})
+
+	// Add header
+	t.AppendHeader(table.Row{"PIPELINE / JOB", "BUILD", "LINE", "TASK", "MATCHED CONTENT"})
+
+	// Add rows
+	for _, r := range results {
 		jobPath := fmt.Sprintf("%s/%s", r.Pipeline, r.Job)
-		if len(jobPath) > 37 {
-			jobPath = jobPath[:34] + "..."
-		}
 
 		task := r.Task
 		if task == "" {
@@ -1246,47 +1279,33 @@ func outputGrep(results []SearchResult, searchPattern string, noColor bool, cont
 			// Remove trailing "/task" if present
 			task = strings.TrimSuffix(task, "/task")
 		}
-		if len(task) > 26 {
-			task = task[:23] + "..."
-		}
 
 		content := strings.TrimSpace(r.Content)
 		// Strip ANSI codes for cleaner display
 		content = stripANSI(content)
-		// Highlight match in content
+		// Highlight match in content - go-pretty handles ANSI codes properly!
 		contentDisplay := highlightMatch(content, searchPattern, noColor)
-		if len(content) > 33 {
-			content = content[:30] + "..."
-			contentDisplay = content // Don't highlight truncated content
-		}
 
-		fmt.Printf("║ %-37s ║ %-8s ║ %-4d ║ %-26s ║ %-33s ║\n", jobPath, r.BuildID, r.Line, task, contentDisplay)
+		// Add main row
+		t.AppendRow(table.Row{jobPath, r.BuildID, r.Line, task, contentDisplay})
 
-		// Print context lines if present
+		// Add context rows if present
 		if len(r.Context) > 0 && contextLines > 0 {
-			fmt.Println("╠═══════════════════════════════════════╩══════════╩══════╩════════════════════════════╩═══════════════════════════════════╣")
-			fmt.Println("║ " + colorCyan + "Context:" + colorReset)
 			for _, ctx := range r.Context {
 				cleanCtx := stripANSI(ctx)
-				if len(cleanCtx) > 120 {
-					cleanCtx = cleanCtx[:117] + "..."
-				}
 				// Highlight match in context
 				if regexp.MustCompile(searchPattern).MatchString(ctx) {
 					cleanCtx = highlightMatch(cleanCtx, searchPattern, noColor)
 				}
-				fmt.Printf("║   %s\n", cleanCtx)
+				// Add context as a row with first columns empty
+				t.AppendRow(table.Row{"  → Context", "", "", "", cleanCtx})
 			}
-			fmt.Println("╠═══════════════════════════════════════╦══════════╦══════╦════════════════════════════╦═══════════════════════════════════╣")
-		}
-
-		// Print separator between rows (not after the last row)
-		if i < len(results)-1 {
-			fmt.Println("╠═══════════════════════════════════════╬══════════╬══════╬════════════════════════════╬═══════════════════════════════════╣")
 		}
 	}
 
-	fmt.Println("╚═══════════════════════════════════════╩══════════╩══════╩════════════════════════════╩═══════════════════════════════════╝")
+	// Render the table
+	fmt.Println()
+	t.Render()
 
 	// Print URLs separately if available
 	if len(results) > 0 && results[0].BuildURLLine != "" {
