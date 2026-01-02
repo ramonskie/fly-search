@@ -481,14 +481,18 @@ func runSearch(ctx context.Context, cmd *cli.Command) error {
 					continue
 				}
 
-				for _, j := range jobs {
+				fmt.Fprintf(os.Stderr, "Fetching builds for %d job(s) in pipeline '%s'...\n", len(jobs), p)
+				for idx, j := range jobs {
+					fmt.Fprintf(os.Stderr, "\rFetching builds... job %d/%d (%s)%s", idx+1, len(jobs), j.Name, clearToEOL)
 					builds, err := getBuilds(target, p, j.Name, buildCount)
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "Warning: failed to get builds for %s/%s: %v\n", p, j.Name, err)
+						fmt.Fprintf(os.Stderr, "\nWarning: failed to get builds for %s/%s: %v\n", p, j.Name, err)
 						continue
 					}
 					allBuilds = append(allBuilds, builds...)
 				}
+				fmt.Fprintf(os.Stderr, "\r%s", clearToEOL) // Clear the progress line
+				fmt.Fprintf(os.Stderr, "Fetched builds for %d job(s)\n", len(jobs))
 			} else {
 				// Get builds for specific job
 				builds, err := getBuilds(target, p, job, buildCount)
