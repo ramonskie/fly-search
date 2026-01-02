@@ -4,6 +4,11 @@ A CLI tool to search across multiple Concourse build logs efficiently.
 
 ## Features
 
+- **Terminal-responsive tables** - Beautiful, adaptive table output that adjusts to your terminal width
+  - Dynamic column sizing (40-120 characters for content)
+  - Intelligent line wrapping instead of truncation
+  - Rounded Unicode borders for modern terminals
+  - Perfect ANSI color support without breaking alignment
 - **Search ALL pipelines** - Use `-all-pipelines` flag to search across every pipeline in your target (requires explicit opt-in)
 - **Intelligent caching** - Caches both build logs AND pipeline/job/build metadata for blazing fast repeated searches
   - Build logs cached for 24 hours (configurable)
@@ -26,6 +31,31 @@ A CLI tool to search across multiple Concourse build logs efficiently.
 
 ## Installation
 
+### Download Pre-built Binary (Recommended)
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/ramonskie/fly-search/releases/latest):
+
+```bash
+# Linux (amd64)
+wget https://github.com/ramonskie/fly-search/releases/latest/download/fly-search-linux-amd64
+chmod +x fly-search-linux-amd64
+sudo mv fly-search-linux-amd64 /usr/local/bin/fly-search
+
+# macOS (Intel)
+wget https://github.com/ramonskie/fly-search/releases/latest/download/fly-search-darwin-amd64
+chmod +x fly-search-darwin-amd64
+sudo mv fly-search-darwin-amd64 /usr/local/bin/fly-search
+
+# macOS (Apple Silicon)
+wget https://github.com/ramonskie/fly-search/releases/latest/download/fly-search-darwin-arm64
+chmod +x fly-search-darwin-arm64
+sudo mv fly-search-darwin-arm64 /usr/local/bin/fly-search
+```
+
+### Build from Source
+
+Requires Go 1.16+:
+
 ```bash
 go build -o fly-search
 ```
@@ -33,7 +63,7 @@ go build -o fly-search
 Or install directly:
 
 ```bash
-go install
+go install github.com/ramonskie/fly-search@latest
 ```
 
 ## Usage
@@ -248,36 +278,36 @@ Set custom cache expiration (examples: 1h, 30m, 2h30m):
 
 ### Table Format (default)
 
-Clean, structured table with build information and colorized output:
+Beautiful, terminal-responsive table with build information and colorized output:
 
 ```
-╔═══════════════════════════════════════╦══════════╦══════╦════════════════════════════╦═══════════════════════════════════╗
-║ PIPELINE / JOB                        ║ BUILD    ║ LINE ║ TASK                       ║ MATCHED CONTENT                   ║
-╠═══════════════════════════════════════╬══════════╬══════╬════════════════════════════╬═══════════════════════════════════╣
-║ bosh-bootloader/gcp-acceptance-tes... ║ 124      ║ 331  ║ bbl-tests                  ║ Using state-dir: /tmp/2099801353  ║
-╠═══════════════════════════════════════╩══════════╩══════╩════════════════════════════╩═══════════════════════════════════╣
-║ Context:
-║   
-║     Captured StdOut/StdErr Output >>
-║     Using state-dir: /tmp/2099801353
-║     List Clusters for Zone me-central2-b: googleapi: Error 403...
-║     step: generating terraform template
-╠═══════════════════════════════════════╦══════════╦══════╦════════════════════════════╦═══════════════════════════════════╣
-╚═══════════════════════════════════════╩══════════╩══════╩════════════════════════════╩═══════════════════════════════════╝
+╭───────────────────────────────┬───────┬──────┬──────────┬─────────────────────────────────────────────────────╮
+│ PIPELINE / JOB                │ BUILD │ LINE │ TASK     │ MATCHED CONTENT                                     │
+├───────────────────────────────┼───────┼──────┼──────────┼─────────────────────────────────────────────────────┤
+│ bosh-deployment/test-bosh-gcp │ 56    │ 64   │ bbl-up   │ + name = "bbl-env-winnipeg-2025-12-30t10-36z-       │
+│                               │       │      │          │ jumpbox-ip"                                         │
+│ bosh-deployment/test-bosh-gcp │ 56    │ 85   │ bbl-up   │ + name = "bbl-env-winnipeg-2025-12-30t10-36z-bosh-  │
+│                               │       │      │          │ director"                                           │
+│  → Context                    │       │      │          │ + network = "bbl-env-winnipeg-2025-12-30t10-36z-    │
+│                               │       │      │          │ network"                                            │
+╰───────────────────────────────┴───────┴──────┴──────────┴─────────────────────────────────────────────────────╯
 
 Build URLs:
-  [Build 124] https://bosh.ci.cloudfoundry.org/teams/main/pipelines/bosh-bootloader/jobs/gcp-acceptance-tests-bump-deployments/builds/124
+  [Build 56] https://bosh.ci.cloudfoundry.org/teams/main/pipelines/bosh-deployment/jobs/test-bosh-gcp/builds/56
 
-Found 1 match(es)
+Found 2 match(es)
 ```
 
 **Features:**
-- Clean table layout with pipeline/job, build number, line number, and task name
-- Matched content highlighted in red (when colors enabled)
-- Context lines shown when `-context` flag is used
-- Full clickable URLs listed separately (no truncation)
-- ANSI color codes automatically stripped for readability
-- Unique build URLs shown once (no duplicates)
+- **Terminal-responsive design**: Automatically adapts to your terminal width
+  - Content column adjusts from 40-120 characters based on available space
+  - Intelligent line wrapping for long content (no more 33-character truncation!)
+  - Works great on narrow (80 cols) and wide (200+ cols) terminals
+- **Beautiful Unicode borders**: Modern rounded box-drawing characters (╭─┬─╮)
+- **Perfect color handling**: Matched content highlighted in red without breaking table alignment
+- **Context lines**: Shown inline when `-context` flag is used
+- **Full clickable URLs**: Listed separately with no truncation
+- **Unique build URLs**: Shown once (no duplicates)
 
 ### JSON Format
 
