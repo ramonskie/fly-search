@@ -260,17 +260,28 @@ func runSearch(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 
-	// Auto-detect Concourse URL from target if not provided
+	// Auto-detect Concourse URL and team from target if not provided
 	baseURL := concourseURL
+	var teamName string
+
 	if baseURL == "" {
-		detectedURL, err := getTargetURL(target)
+		detectedURL, detectedTeam, err := getTargetInfo(target)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to auto-detect Concourse URL: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Warning: failed to auto-detect target info: %v\n", err)
 			fmt.Fprintf(os.Stderr, "Build links will not be generated. Use --url flag to specify manually.\n\n")
-		} else {
-			baseURL = detectedURL
-			fmt.Fprintf(os.Stderr, "Auto-detected Concourse URL: %s\n", baseURL)
+			return fmt.Errorf("failed to get target info: %w", err)
 		}
+		baseURL = detectedURL
+		teamName = detectedTeam
+		fmt.Fprintf(os.Stderr, "Auto-detected Concourse URL: %s\n", baseURL)
+		fmt.Fprintf(os.Stderr, "Using team: %s\n", teamName)
+	} else {
+		_, detectedTeam, err := getTargetInfo(target)
+		if err != nil {
+			return fmt.Errorf("failed to get team for target '%s': %w", target, err)
+		}
+		teamName = detectedTeam
+		fmt.Fprintf(os.Stderr, "Using team: %s\n", teamName)
 	}
 
 	var allBuilds []Build
@@ -328,7 +339,7 @@ func runSearch(ctx context.Context, cmd *cli.Command) error {
 				fmt.Fprintf(os.Stderr, "\rDiscovering builds... pipeline %d/%d (%s)%s", idx+1, len(pipelines), pl.Name, clearToEOL)
 
 				// Get jobs for this pipeline
-				jobs, err := getJobs(target, pl.Name)
+				jobs, err := getJobs(target, teamName, pl.Name)
 				if err != nil {
 					// Silently skip - will show warning at end
 					continue
@@ -458,7 +469,7 @@ func runSearch(ctx context.Context, cmd *cli.Command) error {
 				if !hasCachedJobs {
 					// Fetch jobs from API
 					var err error
-					jobs, err = getJobs(target, p)
+					jobs, err = getJobs(target, teamName, p)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 
@@ -872,28 +883,26 @@ func getAllPipelines(target string) ([]Pipeline, error) {
 	return pipelines, nil
 }
 
-func getTargetURL(target string) (string, error) {
+func getTargetInfo(target string) (url string, team string, err error) {
 	cmd := exec.Command("fly", "targets")
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("failed to run fly targets: %w", err)
+	output, cmdErr := cmd.Output()
+	if cmdErr != nil {
+		return "", "", fmt.Errorf("failed to run fly targets: %w", cmdErr)
 	}
 
-	// Parse the output to find the target URL
-	// Format: targetName    URL    team    expiry
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == target {
-			return fields[1], nil
+		if len(fields) >= 3 && fields[0] == target {
+			return fields[1], fields[2], nil
 		}
 	}
 
-	return "", fmt.Errorf("target '%s' not found in fly targets", target)
+	return "", "", fmt.Errorf("target '%s' not found in fly targets", target)
 }
 
-func getJobs(target, pipeline string) ([]Job, error) {
-	cmd := exec.Command("fly", "-t", target, "curl", fmt.Sprintf("/api/v1/teams/main/pipelines/%s/jobs", pipeline))
+func getJobs(target, team, pipeline string) ([]Job, error) {
+	cmd := exec.Command("fly", "-t", target, "curl", fmt.Sprintf("/api/v1/teams/%s/pipelines/%s/jobs", team, pipeline))
 	output, err := cmd.Output()
 
 	// Check for authentication errors
